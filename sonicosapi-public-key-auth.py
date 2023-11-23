@@ -25,6 +25,7 @@ parser.add_argument('--address', required=True, help='IP/FQDN of the target fire
 parser.add_argument('--user', required=True, help='Firewall management username.')
 parser.add_argument('--password', required=True, help='Firewall management password.')
 parser.add_argument('--preempt', required=False, action='store_true', help='Override/Preempt current management session.')
+parser.add_argument('--firmware_upload', required=False, help='Upload firmware via SonicOS API. Path/to/firmware/image.bin.sig')
 
 args = parser.parse_args()
 
@@ -37,14 +38,17 @@ print("Refer to https://www.sonicwall.com/support/technical-documentation/docs/s
 
 
 def show_response_info(resp):
-    if response.status_code == 200:
+    if isinstance(resp, dict):
+        print(resp.get('status', {}).get('info', {}))
+
+    if resp.status_code == 200:
         # Print the HTTP response details
-        print(response.json())
+        print(resp.json())
     else:
-        print(response.status_code)
-        print(response.headers)
-        print(response.text)
-        print(response.request.headers)
+        print(resp.status_code)
+        print(resp.headers)
+        print(resp.text)
+        print(resp.request.headers)
 
 
 print("\nSending a POST to /api/sonicos/auth to retrieve the public key from the WWW-Authenticate header. Saving it to 'SWPEMFILE'.")
@@ -67,16 +71,16 @@ if response.status_code == 401 or response.status_code == 200:
         formatted_public_key = f"-----BEGIN PUBLIC KEY-----\n{public_key}\n-----END PUBLIC KEY-----"
         with open("pk.pem", "w") as file:
             file.write(formatted_public_key)
-        print("Public key saved to pk.pem\n")
+        print("Public key saved to pk.pem")
     else:
-        print("Public key not found in the WWW-Authenticate header.\n")
+        print("Public key not found in the WWW-Authenticate header.")
 else:
-    print(f"Error: HTTP status code {response.status_code}\n")
+    print(f"Error: HTTP status code {response.status_code}")
     print(response.text)
     print()
 
 
-print("Loading the public key data.\n")
+print("Loading the public key data.")
 
 # Read the public key from the pk.pem file
 with open("pk.pem", "rb") as key_file:
@@ -104,17 +108,68 @@ encoded_cipher = base64.b64encode(cipher).decode('utf-8')
 # Build the Authorization header with the management username and CIPHER. Authenticate to SonicOS API.
 authorization_header = f'SNWL-PK-AUTH user="{sw_user}", data="{encoded_cipher}"'
 
-print("\nSending POST with username and cipher data.")
+print("Sending POST to /auth with username and cipher data.")
 response = requests.post(url + "/auth", headers={'Authorization': authorization_header}, verify=False)
+r = response.json()
 show_response_info(response)
+if r['status']['success']:
+    print("Authenticated!")
+print()
 
-print("\n\n")
+# Start management (for admin users that do not go straight to management).
+# response = requests.post(url + "/start-management", verify=False)
+# show_response_info(response)
+# print()
 
-# Switch to config mode. Likely already in config mode.
-response = requests.post(url + "/start-management", verify=False)
+# Switch to config mode.
+print("Switching to configuration mode. GET /config-mode")
+response = requests.post(url + "/config-mode", verify=False)
 show_response_info(response)
+print()
 
 # Get current SonicOS version info.
+print("GET /version")
 response = requests.get(url + "/version", verify=False)
 show_response_info(response)
+print()
+
+# Uploading firmware images.
+if args.firmware_upload:
+    print("The firmware_upload argument was set. Upload:", args.firmware_upload)
     
+    # Imports these only if uploading firmware.
+    from requests_toolbelt.multipart.encoder import (
+        MultipartEncoder,
+        MultipartEncoderMonitor
+    )
+    
+    firmware_file = args.firmware_upload
+    filename = firmware_file.split('/')[-1]
+    with open(firmware_file, 'rb') as fw_file:
+        multipart_data = MultipartEncoder(
+            fields={
+                'firmware': (filename, fw_file, 'application/octet-stream')
+            }
+        )
+        
+        custom_headers = {
+            'Content-Type': multipart_data.content_type,
+            'Expires': '-1'
+        }
+        
+        try:
+            print('Uploading firmware file:', firmware_file, "POST to /import/firmware")
+            upload_response = requests.post(url + "/import/firmware", data=multipart_data, headers=custom_headers, verify=False, timeout=300)
+        
+            if upload_response.status_code == 200:
+                print('HTTP 200 OK --> /import/firmware')
+                print(upload_response.json())
+                print()
+            else:
+                print(f"Failed to upload firmware: HTTP Status: {upload_response.status_code}")
+                print(upload_response.json())
+                print()
+                
+        except requests.exceptions.ChunkedEncodingError as e:
+            print(f'Failed to upload firmware: {e}')
+            print("Note: You should check if the firmware uploaded despite the exception.")
